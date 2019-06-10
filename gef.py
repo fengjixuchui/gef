@@ -560,8 +560,8 @@ class Elf:
     - http://refspecs.freestandards.org/elf/elfspec_ppc.pdf
     - http://refspecs.linuxfoundation.org/ELF/ppc64/PPC-elf64abi.html
     """
-    BIG_ENDIAN        = 0
     LITTLE_ENDIAN     = 1
+    BIG_ENDIAN        = 2
 
     ELF_32_BITS       = 0x01
     ELF_64_BITS       = 0x02
@@ -1481,7 +1481,7 @@ def checksec(filename):
     results["PIE"] = __check_security_property("-h", filename, r":.*EXEC") is False
     results["Fortify"] = __check_security_property("-s", filename, r"_chk@GLIBC") is True
     results["Partial RelRO"] = __check_security_property("-l", filename, r"GNU_RELRO") is True
-    results["Full RelRO"] = __check_security_property("-d", filename, r"BIND_NOW") is True
+    results["Full RelRO"] = results["Partial RelRO"] and __check_security_property("-d", filename, r"BIND_NOW") is True
     return results
 
 
@@ -1578,7 +1578,7 @@ class Architecture(object):
     def ptrsize(self):
         return get_memory_alignment()
 
-    def get_ith_parameter(self, i):
+    def get_ith_parameter(self, i, in_func=True):
         """Retrieves the correct parameter used for the current function call."""
         reg = self.function_parameters[i]
         val = get_register(reg)
@@ -2026,7 +2026,9 @@ class X86(Architecture):
             "popad",]
         return "; ".join(insns)
 
-    def get_ith_parameter(self, i):
+    def get_ith_parameter(self, i, in_func=True):
+        if in_func:
+            i += 1 # Account for RA being at the top of the stack
         sp = current_arch.sp
         sz =  current_arch.ptrsize
         loc = sp + (i * sz)
@@ -2417,13 +2419,13 @@ def read_cstring_from_memory(address, max_length=GEF_MAX_STRING_LENGTH, encoding
 
     char_ptr = cached_lookup_type("char").pointer()
 
+    length = min(address|(DEFAULT_PAGE_SIZE-1), max_length+1)
     try:
-        res = gdb.Value(address).cast(char_ptr).string(encoding=encoding).strip()
+        res = gdb.Value(address).cast(char_ptr).string(encoding=encoding, length=length).strip()
     except gdb.error:
-        length = min(address|(DEFAULT_PAGE_SIZE-1), max_length+1)
-        mem = bytes(read_memory(address, length)).decode("utf-8")
-        res = mem.split("\x00", 1)[0]
+        res = bytes(read_memory(address, length)).decode("utf-8")
 
+    res = res.split("\x00", 1)[0]
     ustr = res.replace("\n","\\n").replace("\r","\\r").replace("\t","\\t")
     if max_length and len(res) > max_length:
         return "{}[...]".format(ustr[:max_length])
@@ -4617,13 +4619,11 @@ class PCustomCommand(GenericCommand):
             err("Invalid structure name '{:s}'".format(struct_name))
             return
 
-        _class = self.get_class(mod_name, struct_name)
-        _offset = 0
+        _class, _struct = self.get_structure_class(mod_name, struct_name)
 
-        for _name, _type in _class._fields_:
+        for _name, _type in _struct._fields_:
             _size = ctypes.sizeof(_type)
-            gef_print("+{:04x} {:s} {:s} ({:#x})".format(_offset, _name, _type.__name__, _size))
-            _offset += _size
+            gef_print("+{:04x} {:s} {:s} ({:#x})".format(getattr(_class, _name).offset, _name, _type.__name__, _size))
         return
 
 
@@ -4638,10 +4638,10 @@ class PCustomCommand(GenericCommand):
         return imp.load_source(modname, _fullname)
 
 
-    def get_class(self, modname, classname):
+    def get_structure_class(self, modname, classname):
         _mod = self.get_module(modname)
-        return getattr(_mod, classname)()
-
+        _class = getattr(_mod, classname)
+        return _class, _class()
 
     def list_all_structs(self, modname):
         _mod = self.get_module(modname)
@@ -4658,21 +4658,20 @@ class PCustomCommand(GenericCommand):
             return
 
         try:
-            _class = self.get_class(mod_name, struct_name)
-            data = read_memory(addr, ctypes.sizeof(_class))
+            _class, _struct = self.get_structure_class(mod_name, struct_name)
+            data = read_memory(addr, ctypes.sizeof(_struct))
         except gdb.MemoryError:
             err("{}Cannot reach memory {:#x}".format(" "*depth, addr))
             return
 
-        self.deserialize(_class, data)
+        self.deserialize(_struct, data)
 
         _regsize = get_memory_alignment()
-        _offset = 0
 
-        for field in _class._fields_:
+        for field in _struct._fields_:
             _name, _type = field
-            _size = ctypes.sizeof(_type)
-            _value = getattr(_class, _name)
+            _value = getattr(_struct, _name)
+            _offset = getattr(_class, _name).offset
 
             if    (_regsize == 4 and _type is ctypes.c_uint32) \
                or (_regsize == 8 and _type is ctypes.c_uint64) \
@@ -4684,16 +4683,13 @@ class PCustomCommand(GenericCommand):
             line += "  "*depth
             line += ("{:#x}+0x{:04x} {} : ".format(addr, _offset, _name)).ljust(40)
             line += "{} ({})".format(_value, _type.__name__)
-            parsed_value = self.get_ctypes_value(_class, _name, _value)
+            parsed_value = self.get_ctypes_value(_struct, _name, _value)
             if parsed_value:
                 line += " {} {}".format(RIGHT_ARROW, parsed_value)
             gef_print("".join(line))
 
             if issubclass(_type, ctypes.Structure):
                 self.apply_structure_to_address(mod_name, _type.__name__, addr + _offset, depth + 1)
-                _offset += ctypes.sizeof(_type)
-            else:
-                _offset += _size
         return
 
 
@@ -4787,9 +4783,9 @@ class ChangeFdCommand(GenericCommand):
             address = socket.gethostbyname(new_output.split(":")[0])
             port = int(new_output.split(":")[1])
 
-            # socket(int domain, int type, int protocol)
-            # AF_INET = 2, SOCK_STREAM = 1
-            res = gdb.execute("""call socket(2, 1, 0)""", to_string=True)
+            AF_INET = 2
+            SOCK_STREAM = 1
+            res = gdb.execute("""call (int)socket({}, {}, 0)""".format(AF_INET, SOCK_STREAM), to_string=True)
             new_fd = self.get_fd_from_result(res)
 
             # fill in memory with sockaddr_in struct contents
@@ -4803,8 +4799,7 @@ class ChangeFdCommand(GenericCommand):
             write_memory(stack_addr + 0x4, socket.inet_aton(address), 4)
 
             info("Trying to connect to {}".format(new_output))
-            # connect(int sockfd, const struct sockaddr *addr, socklen_t addrlen)
-            res = gdb.execute("""call connect({}, {}, {})""".format(new_fd, stack_addr, 16), to_string=True)
+            res = gdb.execute("""call (int)connect({}, {}, {})""".format(new_fd, stack_addr, 16), to_string=True)
 
             # recover stack state
             write_memory(stack_addr, original_contents, 8)
@@ -4816,20 +4811,23 @@ class ChangeFdCommand(GenericCommand):
 
             info("Connected to {}".format(new_output))
         else:
-            res = gdb.execute("""call open("{:s}", 66, 0666)""".format(new_output), to_string=True)
+            res = gdb.execute("""call (int)open("{:s}", 66, 0666)""".format(new_output), to_string=True)
             new_fd = self.get_fd_from_result(res)
 
         info("Opened '{:s}' as fd #{:d}".format(new_output, new_fd))
-        gdb.execute("""call dup2({:d}, {:d})""".format(new_fd, old_fd), to_string=True)
+        gdb.execute("""call (int)dup2({:d}, {:d})""".format(new_fd, old_fd), to_string=True)
         info("Duplicated fd #{:d}{:s}#{:d}".format(new_fd, RIGHT_ARROW, old_fd))
-        gdb.execute("""call close({:d})""".format(new_fd), to_string=True)
+        gdb.execute("""call (int)close({:d})""".format(new_fd), to_string=True)
         info("Closed extra fd #{:d}".format(new_fd))
         ok("Success")
         return
 
     def get_fd_from_result(self, res):
         # Output example: $1 = 3
-        return int(res.split()[2], 0)
+        res = int(res.split()[2], 0)
+        res = gdb.execute("""p/d {}""".format(res), to_string=True)
+        res = int(res.split()[2], 0)
+        return res
 
 
 @register_command
@@ -4946,7 +4944,7 @@ class IdaInteractCommand(GenericCommand):
                 else:
                     res = method()
 
-                if method_name in ("ImportStruct", "ImportStructs"):
+                if method_name == "importstruct":
                     self.import_structures(res)
                 else:
                     gef_print(str(res))
@@ -5144,9 +5142,23 @@ class SearchPatternCommand(GenericCommand):
     the command will also try to look for upwards cross-references to this address."""
 
     _cmdline_ = "search-pattern"
-    _syntax_  = "{:s} PATTERN [small|big]".format(_cmdline_)
+    _syntax_  = "{:s} PATTERN [small|big] [section]".format(_cmdline_)
     _aliases_ = ["grep", "xref"]
-    _example_ = "\n{0:s} AAAAAAAA\n{0:s} 0x555555554000".format(_cmdline_)
+    _example_ = "\n{0:s} AAAAAAAA\n{0:s} 0x555555554000 little stack\n{0:s}AAAA 0x600000-0x601000".format(_cmdline_)
+
+    def print_section(self, section):
+        title = "In "
+        if section.path:
+            title += "'{}'".format(Color.blueify(section.path) )
+
+        title += "({:#x}-{:#x})".format(section.page_start, section.page_end)
+        title += ", permission={}".format(section.permission)
+        ok(title)
+        return
+
+    def print_loc(self, loc):
+        gef_print("""  {:#x} - {:#x} {}  "{}" """.format(loc[0], loc[1], RIGHT_ARROW, Color.pinkify(loc[2]),))
+        return
 
     def search_pattern_by_address(self, pattern, start_address, end_address):
         """Search a pattern within a range defined by arguments."""
@@ -5176,17 +5188,12 @@ class SearchPatternCommand(GenericCommand):
 
         return locations
 
-    def search_pattern(self, pattern, endian):
+    def search_pattern(self, pattern, section_name):
         """Search a pattern within the whole userland memory."""
-        if is_hex(pattern):
-            if endian == Elf.BIG_ENDIAN:
-                pattern = "".join(["\\x"+pattern[i:i+2] for i in range(2, len(pattern), 2)])
-            else:
-                pattern = "".join(["\\x"+pattern[i:i+2] for i in range(len(pattern)-2, 0, -2)])
-
         for section in get_process_maps():
             if not section.permission & Permission.READ: continue
             if section.path == "[vvar]": continue
+            if not section_name in section.path: continue
 
             start = section.page_start
             end   = section.page_end - 1
@@ -5196,16 +5203,10 @@ class SearchPatternCommand(GenericCommand):
                 addr_loc_start = lookup_address(loc[0])
                 if addr_loc_start and addr_loc_start.section:
                     if old_section != addr_loc_start.section:
-                        title = "In "
-                        if addr_loc_start.section.path:
-                            title += "'{}'".format(Color.blueify(addr_loc_start.section.path) )
-
-                        title+= "({:#x}-{:#x})".format(addr_loc_start.section.page_start, addr_loc_start.section.page_end)
-                        title+= ", permission={}".format(addr_loc_start.section.permission)
-                        ok(title)
+                        self.print_section(addr_loc_start.section)
                         old_section = addr_loc_start.section
 
-                gef_print("""  {:#x} - {:#x} {}  "{}" """.format(loc[0], loc[1], RIGHT_ARROW, Color.pinkify(loc[2]),))
+                self.print_loc(loc)
         return
 
     @only_if_gdb_running
@@ -5217,12 +5218,38 @@ class SearchPatternCommand(GenericCommand):
 
         pattern = argv[0]
         endian = get_endian()
-        if argc==2:
-            if argv[1]=="big": endian = Elf.BIG_ENDIAN
-            elif argv[1]=="small": endian = Elf.LITTLE_ENDIAN
 
-        info("Searching '{:s}' in memory".format(Color.yellowify(pattern)))
-        self.search_pattern(pattern, endian)
+        if argc >= 2:
+            if argv[1].lower() == "big": endian = Elf.BIG_ENDIAN
+            elif argv[1].lower() == "small": endian = Elf.LITTLE_ENDIAN
+
+        if is_hex(pattern):
+            if endian == Elf.BIG_ENDIAN:
+                pattern = "".join(["\\x"+pattern[i:i+2] for i in range(2, len(pattern), 2)])
+            else:
+                pattern = "".join(["\\x"+pattern[i:i+2] for i in range(len(pattern) - 2, 0, -2)])
+
+        if argc == 3:
+            info("Searching '{:s}' in {:s}".format(Color.yellowify(pattern), argv[2]))
+
+            if "0x" in argv[2]:
+                start, end = parse_string_range(argv[2])
+
+                loc = lookup_address(start)
+                if loc.valid:
+                    self.print_section(loc.section)
+
+                for loc in self.search_pattern_by_address(pattern, start, end):
+                    self.print_loc(loc)
+            else:
+                section_name = argv[2]
+                if section_name == "binary":
+                    section_name = get_filepath()
+
+                self.search_pattern(pattern, section_name)
+        else:
+            info("Searching '{:s}' in memory".format(Color.yellowify(pattern)))
+            self.search_pattern(pattern, "")
         return
 
 
@@ -7280,7 +7307,7 @@ class ContextCommand(GenericCommand):
 
         widest = l = max(map(len, current_arch.all_registers))
         l += 5
-        l += current_arch.ptrsize
+        l += current_arch.ptrsize * 2
         nb = get_terminal_size()[1]//l
         i = 1
         line = ""
@@ -7318,7 +7345,7 @@ class ContextCommand(GenericCommand):
             else:
                 line += "{}: ".format(Color.colorify(padreg, changed_color))
             if new_value_type_flag:
-                line += "{:s} ".format(str(value))
+                line += "{:s} ".format(format_address_spaces(value))
             else:
                 addr = lookup_address(align_address(long(value)))
                 if addr.valid:
@@ -7463,7 +7490,7 @@ class ContextCommand(GenericCommand):
         args = []
 
         for i, f in enumerate(symbol.type.fields()):
-            _value = current_arch.get_ith_parameter(i)[1]
+            _value = current_arch.get_ith_parameter(i, in_func=False)[1]
             _value = RIGHT_ARROW.join(DereferenceCommand.dereference_from(_value))
             _name = f.name or "var_{}".format(i)
             _type = f.type.name or self.size2type[f.type.sizeof]
@@ -7533,7 +7560,7 @@ class ContextCommand(GenericCommand):
 
         args = []
         for i in range(nb_argument):
-            _key, _value = current_arch.get_ith_parameter(i)
+            _key, _value = current_arch.get_ith_parameter(i, in_func=False)
             _value = RIGHT_ARROW.join(DereferenceCommand.dereference_from(_value))
             args.append("{} = {}".format(Color.colorify(_key, arg_key_color), _value))
 
@@ -7869,8 +7896,8 @@ class HexdumpCommand(GenericCommand):
     """Display SIZE lines of hexdump from the memory location pointed by ADDRESS. """
 
     _cmdline_ = "hexdump"
-    _syntax_  = "{:s} (qword|dword|word|byte) ADDRESS [[L][SIZE]] [UP|DOWN] [S]".format(_cmdline_)
-    _example_ = "{:s} byte $rsp L16 DOWN".format(_cmdline_)
+    _syntax_  = "{:s} [qword|dword|word|byte] [ADDRESS] [[L][SIZE]] [REVERSE]".format(_cmdline_)
+    _example_ = "{:s} byte $rsp L16 REVERSE".format(_cmdline_)
 
     def __init__(self):
         super(HexdumpCommand, self).__init__(complete=gdb.COMPLETE_LOCATION)
@@ -7879,44 +7906,39 @@ class HexdumpCommand(GenericCommand):
 
     @only_if_gdb_running
     def do_invoke(self, argv):
-        argc = len(argv)
-        if argc < 2:
-            self.usage()
-            return
-
-        arg0, argv = argv[0].lower(), argv[1:]
+        fmt = "byte"
+        target = "$sp"
         valid_formats = ["byte", "word", "dword", "qword"]
-        fmt = None
-        for valid_format in valid_formats:
-            if valid_format.startswith(arg0):
-                fmt = valid_format
-                break
-        if not fmt:
-            self.usage()
-            return
+        read_len = None
+        reverse = False
+        
+        for arg in argv:
+            arg = arg.lower()
+            is_format_given = False
+            for valid_format in valid_formats:
+                if valid_format.startswith(arg):
+                    fmt = valid_format
+                    is_format_given = True
+                    break
+            if is_format_given:
+                continue
+            if arg.startswith("l"):
+                arg = arg[1:]
+            try:
+                read_len = long(arg, 0)
+                continue
+            except ValueError:
+                pass
 
-        start_addr = to_unsigned_long(gdb.parse_and_eval(argv[0]))
+            if "reverse".startswith(arg):
+                reverse = True
+                continue
+            target = arg
+            
+        start_addr = to_unsigned_long(gdb.parse_and_eval(target))
         read_from = align_address(start_addr)
-        read_len = 0x40 if fmt=="byte" else 0x10
-        up_to_down = True
-
-        if argc >= 2:
-            for arg in argv[1:]:
-                arg = arg.lower()
-                if arg.startswith("l"):
-                    arg = arg[1:]
-                try:
-                    read_len = long(arg, 0)
-                    continue
-                except ValueError:
-                    pass
-
-                if arg in {"up", "u"}:
-                    up_to_down = True
-                    continue
-                elif arg in {"down", "d"}:
-                    up_to_down = False
-                    continue
+        if not read_len:
+            read_len = 0x40 if fmt=="byte" else 0x10
 
         if fmt == "byte":
             read_from += self.repeat_count * read_len
@@ -7925,7 +7947,7 @@ class HexdumpCommand(GenericCommand):
         else:
             lines = self._hexdump(read_from, read_len, fmt, self.repeat_count * read_len)
 
-        if not up_to_down:
+        if reverse:
             lines.reverse()
 
         gef_print("\n".join(lines))
@@ -8089,19 +8111,18 @@ class DereferenceCommand(GenericCommand):
 
     @only_if_gdb_running
     def do_invoke(self, argv):
-        argc = len(argv)
-
-        if argc < 1:
-            err("Missing location.")
-            return
-
+        target = "$sp"
         nb = 10
-        if argc==2 and argv[1][0] in ("l", "L") and argv[1][1:].isdigit():
-            nb = int(argv[1][1:])
-        elif argc == 2 and argv[1].isdigit():
-            nb = int(argv[1])
+        
+        for arg in argv:
+            if arg.isdigit():
+                nb = int(arg)
+            elif arg[0] in ("l", "L") and arg[1:].isdigit():
+                nb = int(arg[1:])
+            else:
+                target = arg
 
-        addr = safe_parse_and_eval(argv[0])
+        addr = safe_parse_and_eval(target)
         if addr is None:
             err("Invalid address")
             return
@@ -9891,8 +9912,8 @@ if __name__  == "__main__":
     else:
         try:
             pyenv = which("pyenv")
-            PYENV_ROOT = subprocess.check_output([pyenv, "root"]).strip()
-            PYENV_VERSION = subprocess.check_output([pyenv, "version-name"]).strip()
+            PYENV_ROOT = gef_pystring(subprocess.check_output([pyenv, "root"]).strip())
+            PYENV_VERSION = gef_pystring(subprocess.check_output([pyenv, "version-name"]).strip())
             site_packages_dir = os.path.join(PYENV_ROOT, "versions", PYENV_VERSION, "lib",
                                              "python{}".format(PYENV_VERSION[:3]), "site-packages")
             site.addsitedir(site_packages_dir)
