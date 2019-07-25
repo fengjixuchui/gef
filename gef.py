@@ -7733,18 +7733,26 @@ class ContextCommand(GenericCommand):
             err("No thread selected")
             return
 
+        selected_thread = gdb.selected_thread()
+
         for i, thread in enumerate(threads):
-            line = """[{:s}] Id {:d}, Name: "{:s}", """.format(Color.colorify("#{:d}".format(i), "bold pink"),
-                                                               thread.num, thread.name or "")
+            line = """[{:s}] Id {:d}, """.format(Color.colorify("#{:d}".format(i), "bold green" if thread==selected_thread  else "bold pink"), thread.num)
+            if thread.name:
+                line += """Name: "{:s}", """.format(thread.name)
             if thread.is_running():
                 line += Color.colorify("running", "bold green")
             elif thread.is_stopped():
                 line += Color.colorify("stopped", "bold red")
+                thread.switch()
+                frame = gdb.selected_frame()
+                line += " {:s} in {:s} ()".format(Color.colorify("{:#x}".format(frame.pc()), "blue"),Color.colorify(frame.name() or "??" ,"bold yellow"))
                 line += ", reason: {}".format(Color.colorify(reason(), "bold pink"))
             elif thread.is_exited():
                 line += Color.colorify("exited", "bold yellow")
             gef_print(line)
             i += 1
+
+        selected_thread.switch()
         return
 
 
@@ -8764,10 +8772,10 @@ class ChecksecCommand(GenericCommand):
         for prop in sec:
             if prop in ("Partial RelRO", "Full RelRO"): continue
             val = sec[prop]
-            msg = Color.greenify("Yes") if val is True else Color.redify("No")
+            msg = Color.greenify(Color.boldify(TICK)) if val is True else Color.redify(Color.boldify(CROSS))
             if val and prop=="Canary" and is_alive():
                 canary = gef_read_canary()[0]
-                msg+= "{} value: {:#x}".format(RIGHT_ARROW, canary)
+                msg+= "(value: {:#x})".format(canary)
 
             gef_print("{:<30s}: {:s}".format(prop, msg))
 
@@ -8776,7 +8784,7 @@ class ChecksecCommand(GenericCommand):
         elif sec["Partial RelRO"]:
             gef_print("{:<30s}: {:s}".format("RelRO", Color.yellowify("Partial")))
         else:
-            gef_print("{:<30s}: {:s}".format("RelRO", Color.redify("No")))
+            gef_print("{:<30s}: {:s}".format("RelRO", Color.redify(Color.boldify(CROSS))))
         return
 
 
