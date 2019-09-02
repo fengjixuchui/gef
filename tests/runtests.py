@@ -62,15 +62,15 @@ class TestGefCommands(GefUnitTestGeneric): #pylint: disable=too-many-public-meth
 
         target = "tests/binaries/checksec-no-canary.out"
         res = gdb_run_cmd(cmd, target=target)
-        self.assertIn("Canary                        : No", res)
+        self.assertIn("Canary                        : ✘", res)
 
         target = "tests/binaries/checksec-no-nx.out"
         res = gdb_run_cmd(cmd, target=target)
-        self.assertIn("NX                            : No", res)
+        self.assertIn("NX                            : ✘", res)
 
         target = "tests/binaries/checksec-no-pie.out"
         res = gdb_run_cmd(cmd, target=target)
-        self.assertIn("PIE                           : No", res)
+        self.assertIn("PIE                           : ✘", res)
         return
 
     def test_cmd_dereference(self):
@@ -504,7 +504,7 @@ class TestGefCommands(GefUnitTestGeneric): #pylint: disable=too-many-public-meth
             "highlight add 42424242 blue",
             "highlight add 43434343 green",
             "highlight add 44444444 pink",
-            'set $rsp = "AAAABBBBCCCCDDDD"',
+            'patch string $rsp "AAAABBBBCCCCDDDD"',
             "hexdump qword $rsp 2"
         ]
 
@@ -557,18 +557,20 @@ class TestGefFunctions(GefUnitTestGeneric):
 class TestGdbFunctions(GefUnitTestGeneric):
     """Tests gdb convenience functions added by GEF."""
 
-    def test_func_pie(self):
-        cmd = "x/s $_pie()"
+    def test_func_base(self):
+        cmd = "x/s $_base()"
         self.assertFailIfInactiveSession(gdb_run_cmd(cmd))
         res = gdb_start_silent_cmd(cmd)
         self.assertNoException(res)
         self.assertIn("\\177ELF", res)
+        addr = res.splitlines()[-1].split()[0][:-1]
 
-        cmd = "x/s $_pie(1)"
+        cmd = "x/s $_base(\"libc\")"
         res = gdb_start_silent_cmd(cmd)
         self.assertNoException(res)
-        self.assertNotIn("\\177ELF", res)
-        self.assertIn("ELF", res)
+        self.assertIn("\\177ELF", res)
+        addr2 = res.splitlines()[-1].split()[0][:-1]
+        self.assertNotEqual(addr, addr2)
         return
 
     def test_func_heap(self):
