@@ -204,6 +204,7 @@ __gef_remote__                         = None
 __gef_qemu_mode__                      = False
 __gef_default_main_arena__             = "main_arena"
 __gef_int_stream_buffer__              = None
+__gef_redirect_output_fd__             = None
 
 DEFAULT_PAGE_ALIGN_SHIFT               = 12
 DEFAULT_PAGE_SIZE                      = 1 << DEFAULT_PAGE_ALIGN_SHIFT
@@ -211,9 +212,8 @@ GEF_RC                                 = os.path.join(os.getenv("HOME"), ".gef.r
 GEF_TEMP_DIR                           = os.path.join(tempfile.gettempdir(), "gef")
 GEF_MAX_STRING_LENGTH                  = 50
 
-GDB_MIN_VERSION                         = (7, 7)
-GDB_VERSION_MAJOR, GDB_VERSION_MINOR    = [int(_) for _ in re.search(r"(\d+)[^\d]+(\d+)", gdb.VERSION).groups()]
-GDB_VERSION                             = (GDB_VERSION_MAJOR, GDB_VERSION_MINOR)
+GDB_MIN_VERSION                        = (7, 7)
+GDB_VERSION                            = tuple(map(int, re.search(r"(\d+)[^\d]+(\d+)", gdb.VERSION).groups()))
 
 current_elf  = None
 current_arch = None
@@ -344,7 +344,7 @@ def bufferize(f):
 
     @functools.wraps(f)
     def wrapper(*args, **kwargs):
-        global __gef_int_stream_buffer__
+        global __gef_int_stream_buffer__, __gef_redirect_output_fd__
 
         if __gef_int_stream_buffer__:
             return f(*args, **kwargs)
@@ -353,8 +353,32 @@ def bufferize(f):
         try:
             rv = f(*args, **kwargs)
         finally:
-            sys.stdout.write(__gef_int_stream_buffer__.getvalue())
-            sys.stdout.flush()
+            redirect = get_gef_setting("context.redirect")
+            if redirect.startswith("/dev/pts/"):
+                if not __gef_redirect_output_fd__:
+                    # if the FD has never been open, open it
+                    fd = open(redirect, "wt")
+                    __gef_redirect_output_fd__ = fd
+                elif redirect != __gef_redirect_output_fd__.name:
+                    # if the user has changed the redirect setting during runtime, update the state
+                    __gef_redirect_output_fd__.close()
+                    fd = open(redirect, "wt")
+                    __gef_redirect_output_fd__ = fd
+                else:
+                    # otherwise, keep using it
+                    fd = __gef_redirect_output_fd__
+            else:
+                fd = sys.stdout
+                __gef_redirect_output_fd__ = None
+
+            if __gef_redirect_output_fd__ and fd.closed:
+                # if the tty was closed, revert back to stdout
+                fd = sys.stdout
+                __gef_redirect_output_fd__ = None
+                set_gef_setting("context.redirect", "")
+
+            fd.write(__gef_int_stream_buffer__.getvalue())
+            fd.flush()
             __gef_int_stream_buffer__ = None
         return rv
 
@@ -987,19 +1011,28 @@ class GlibcChunk:
         return "\n".join(msg) + "\n"
 
 
+pattern_libc_ver = re.compile(rb"glibc (\d+)\.(\d+)")
+
 @lru_cache()
 def get_libc_version():
     sections = get_process_maps()
-    try:
-        for section in sections:
-            if "libc-" in section.path:
+    libc_version = 0, 0
+    for section in sections:
+        if "libc" in section.path:
+            try:
                 libc_version = tuple(int(_) for _ in
-                                     re.search(r"libc-(\d+)\.(\d+)\.so", section.path).groups())
-                break
-        else:
-            libc_version = 0, 0
-    except AttributeError:
-        libc_version = 0, 0
+                                     re.search(r"libc6?[-_](\d+)\.(\d+)\.so", section.path).groups())
+            except AttributeError:
+                try:
+                    data = b""
+                    with open(section.path, "rb") as f:
+                        data = f.read()
+                    for match in re.finditer(pattern_libc_ver, data):
+                        libc_version = tuple(int(_) for _ in match.group().split(b" ")[-1].split(b"."))
+                        break
+                except OSError:
+                    pass
+            break
     return libc_version
 
 
@@ -1234,15 +1267,17 @@ def set_gef_setting(name, value, _type=None, _desc=None):
 
 def gef_makedirs(path, mode=0o755):
     """Recursive mkdir() creation. If successful, return the absolute path of the directory created."""
-    abspath = os.path.realpath(path)
+    abspath = os.path.expanduser(path)
+    abspath = os.path.realpath(abspath)
+
     if os.path.isdir(abspath):
         return abspath
 
     if PYTHON_MAJOR == 3:
-        os.makedirs(path, mode=mode, exist_ok=True) #pylint: disable=unexpected-keyword-arg
+        os.makedirs(abspath, mode=mode, exist_ok=True) #pylint: disable=unexpected-keyword-arg
     else:
         try:
-            os.makedirs(path, mode=mode)
+            os.makedirs(abspath, mode=mode)
         except os.error:
             pass
     return abspath
@@ -1370,6 +1405,7 @@ def gef_next_instruction(addr):
 def gef_disassemble(addr, nb_insn, nb_prev=0):
     """Disassemble `nb_insn` instructions after `addr` and `nb_prev` before `addr`.
     Return an iterator of Instruction objects."""
+    nb_insn = max(1, nb_insn)
     count = nb_insn + 1 if nb_insn & 1 else nb_insn
 
     if nb_prev:
@@ -1588,15 +1624,15 @@ class RISCV(Architecture):
     arch = "RISCV"
     mode = "RISCV"
 
-    all_registers = ["$zero", "$ra", "$sp", "$gp", "$x4", "$t0", "$t1",
-                     "$t2", "$fp", "$s1", "$a1", "$a2", "$a3", "$a4",
-                     "$a5", "$a6", "$a7", "$s2", "$s3", "$s4", "$s5",
-                     "$s6", "$s7", "$s8", "$s9", "$s10", "$s11", "$t3",
-                     "$t4", "$t5", "$t6",]
+    all_registers = ["$zero", "$ra", "$sp", "$gp", "$tp", "$t0", "$t1",
+                     "$t2", "$fp", "$s1", "$a0", "$a1", "$a2", "$a3",
+                     "$a4", "$a5", "$a6", "$a7", "$s2", "$s3", "$s4",
+                     "$s5", "$s6", "$s7", "$s8", "$s9", "$s10", "$s11",
+                     "$t3", "$t4", "$t5", "$t6",]
     return_register = "$a0"
     function_parameters = ["$a0", "$a1", "$a2", "$a3", "$a4", "$a5", "$a6", "$a7"]
     syscall_register = "$a7"
-    syscall_register = "ecall"
+    syscall_instructions = ["ecall"]
     nop_insn = b"\x00\x00\x00\x13"
     # RISC-V has no flags registers
     flag_register = None
@@ -1718,7 +1754,7 @@ class ARM(Architecture):
     @lru_cache()
     def is_thumb(self):
         """Determine if the machine is currently in THUMB mode."""
-        return is_alive() and get_register("$cpsr") & (1<<5)
+        return is_alive() and get_register(self.flag_register) & (1<<5)
 
     @property
     def pc(self):
@@ -1862,7 +1898,26 @@ class AARCH64(ARM):
 
     @classmethod
     def mprotect_asm(cls, addr, size, perm):
-        raise OSError("Architecture {:s} not supported yet".format(cls.arch))
+        _NR_mprotect = 226
+        insns = [
+            "str x8, [sp, -16]!",
+            "str x0, [sp, -16]!",
+            "str x1, [sp, -16]!",
+            "str x2, [sp, -16]!",
+            "mov x8, {:d}".format(_NR_mprotect),
+            "movz x0, 0x{:x}".format(addr & 0xffff),
+            "movk x0, 0x{:x}, lsl 16".format((addr >> 16) & 0xffff),
+            "movk x0, 0x{:x}, lsl 32".format((addr >> 32) & 0xffff),
+            "movk x0, 0x{:x}, lsl 48".format((addr >> 48) & 0xffff),
+            "movz x1, 0x{:x}".format(size & 0xffff),
+            "movk x1, 0x{:x}, lsl 16".format((size >> 16)& 0xffff),
+            "mov x2, {:d}".format(perm),
+            "svc 0",
+            "ldr x2, [sp], 16",
+            "ldr x1, [sp], 16",
+            "ldr x0, [sp], 16",
+            "ldr x8, [sp], 16",]
+        return "; ".join(insns)
 
     def is_conditional_branch(self, insn):
         # https://www.element14.com/community/servlet/JiveServlet/previewBody/41836-102-1-229511/ARM.Reference_Manual.pdf
@@ -2593,12 +2648,12 @@ def get_filename():
 
 
 def download_file(target, use_cache=False, local_name=None):
-    """Download filename `target` inside the mirror tree inside the GEF_TEMP_DIR.
-    The tree architecture must be GEF_TEMP_DIR/gef/<local_pid>/<remote_filepath>.
+    """Download filename `target` inside the mirror tree inside the get_gef_setting("gef.tempdir").
+    The tree architecture must be get_gef_setting("gef.tempdir")/gef/<local_pid>/<remote_filepath>.
     This allow a "chroot-like" tree format."""
 
     try:
-        local_root = os.path.sep.join([GEF_TEMP_DIR, str(get_pid())])
+        local_root = os.path.sep.join([get_gef_setting("gef.tempdir"), str(get_pid())])
         if local_name is None:
             local_path = os.path.sep.join([local_root, os.path.dirname(target)])
             local_name = os.path.sep.join([local_path, os.path.basename(target)])
@@ -2912,7 +2967,10 @@ def get_generic_arch(module, prefix, arch, mode, big_endian, to_string=False):
 
     else:
         arch = getattr(module, "{:s}_ARCH_{:s}".format(prefix, arch))
-        if mode:
+        if prefix == "KS" and mode == "ARM":
+            # this workaround is because keystone.KS_MODE_ARM doesn't exist, must use 0
+            mode = 0
+        elif mode:
             mode = getattr(module, "{:s}_MODE_{:s}".format(prefix, mode))
         else:
             mode = 0
@@ -3159,8 +3217,14 @@ def clear_screen(tty=""):
         gdb.execute("shell clear")
         return
 
-    with open(tty, "w") as f:
-        f.write("\x1b[H\x1b[J")
+    # Since the tty can be closed at any time, a PermissionError exception can
+    # occur when `clear_screen` is called. We handle this scenario properly
+    try:
+        with open(tty, "wt") as f:
+            f.write("\x1b[H\x1b[J")
+    except PermissionError:
+        __gef_redirect_output_fd__ = None
+        set_gef_setting("context.redirect", "")
     return
 
 
@@ -4564,7 +4628,7 @@ class PCustomCommand(GenericCommand):
 
     def __init__(self):
         super(PCustomCommand, self).__init__(complete=gdb.COMPLETE_SYMBOL)
-        self.add_setting("struct_path", os.path.join(GEF_TEMP_DIR, "structs"),
+        self.add_setting("struct_path", os.path.join(get_gef_setting("gef.tempdir"), "structs"),
                          "Path to store/load the structure ctypes files")
         return
 
@@ -4743,7 +4807,7 @@ class PCustomCommand(GenericCommand):
         else:
             info("Editing '{:s}'".format(fullname))
 
-        cmd = os.getenv("EDITOR").split() if os.getenv("EDITOR") else ["nano",]
+        cmd = (os.getenv("EDITOR") or "nano").split()
         cmd.append(fullname)
         retcode = subprocess.call(cmd)
         return retcode
@@ -5828,7 +5892,7 @@ class RemoteCommand(GenericCommand):
             err("Source binary is not readable")
             return
 
-        directory  = os.path.sep.join([GEF_TEMP_DIR, str(get_pid())])
+        directory  = os.path.sep.join([get_gef_setting("gef.tempdir"), str(get_pid())])
         # gdb.execute("file {:s}".format(infos["exe"]))
         self.add_setting("root", directory, "Path to store the remote data")
         ok("Remote information loaded to temporary path '{:s}'".format(directory))
@@ -6412,7 +6476,7 @@ class GlibcHeapFastbinsYCommand(GenericCommand):
 
         gef_print(titlify("Fastbins for arena {:#x}".format(int(arena))))
         for i in range(NFASTBINS):
-            gef_print("Fastbins[idx={:d}, size={:#x}] ".format(i, (i+1)*SIZE_SZ*2), end="")
+            gef_print("Fastbins[idx={:d}, size={:#x}] ".format(i, (i+2)*SIZE_SZ*2), end="")
             chunk = arena.fastbin(i)
             chunks = set()
 
@@ -6519,7 +6583,7 @@ class GlibcHeapLargeBinsCommand(GenericCommand):
         bins = {}
         for i in range(63, 126):
             nb_chunk = GlibcHeapBinsCommand.pprint_bin(arena_addr, i, "large_")
-            if nb_chunk <= 0:
+            if nb_chunk < 0:
                 break
             if nb_chunk > 0:
                 bins[i] = nb_chunk
@@ -9136,7 +9200,7 @@ class SyscallArgsCommand(GenericCommand):
 
     def __init__(self):
         super(SyscallArgsCommand, self).__init__()
-        self.add_setting("path", os.path.join(GEF_TEMP_DIR, "syscall-tables"),
+        self.add_setting("path", os.path.join(get_gef_setting("gef.tempdir"), "syscall-tables"),
                          "Path to store/load the syscall tables files")
         return
 
@@ -9147,6 +9211,7 @@ class SyscallArgsCommand(GenericCommand):
         if path is None:
             err("Cannot open '{0}': check directory and/or `gef config {0}` setting, "
                 "currently: '{1}'".format("syscall-args.path", self.get_setting("path")))
+            info("This setting can be configured by running gef-extras' install script.")
             return
 
         arch = current_arch.__class__.__name__
@@ -9170,9 +9235,9 @@ class SyscallArgsCommand(GenericCommand):
 
         headers = ["Parameter", "Register", "Value"]
         param_names = [re.split(r" |\*", p)[-1] for p in parameters]
-        info(Color.colorify("{:<28} {:<28} {}".format(*headers), color))
+        info(Color.colorify("{:<20} {:<20} {}".format(*headers), color))
         for name, register, value in zip(param_names, registers, values):
-            line = "    {:<15} {:<15} 0x{:x}".format(name, register, value)
+            line = "    {:<20} {:<20} 0x{:x}".format(name, register, value)
 
             addrs = DereferenceCommand.dereference_from(value)
 
@@ -9370,6 +9435,7 @@ class GefCommand(gdb.Command):
         set_gef_setting("gef.autosave_breakpoints_file", "", str, "Automatically save and restore breakpoints")
         set_gef_setting("gef.extra_plugins_dir", "", str, "Autoload additional GEF commands from external directory")
         set_gef_setting("gef.disable_color", False, bool, "Disable all colors in GEF")
+        set_gef_setting("gef.tempdir", GEF_TEMP_DIR, str, "Directory to use for temporary/cache content")
         self.loaded_commands = []
         self.loaded_functions = []
         self.missing_commands = {}
@@ -9397,7 +9463,6 @@ class GefCommand(gdb.Command):
             # if here, at least one extra plugin was loaded, so we need to restore
             # the settings once more
             gdb.execute("gef restore quiet")
-
         return
 
 
@@ -9753,6 +9818,9 @@ class GefRestoreCommand(gdb.Command):
                 except Exception:
                     pass
 
+        # ensure that the temporary directory always exists
+        gef_makedirs(__config__["gef.tempdir"][0])
+
         if not quiet:
             ok("Configuration from '{:s}' restored".format(Color.colorify(GEF_RC, "bold blue")))
         return
@@ -10021,13 +10089,11 @@ if __name__  == "__main__":
         # SIGALRM will simply display a message, but gdb won't forward the signal to the process
         gdb.execute("handle SIGALRM print nopass")
 
-        # saving GDB indexes in GEF tempdir
-        gef_makedirs(GEF_TEMP_DIR)
-        gdb.execute("save gdb-index {}".format(GEF_TEMP_DIR))
-
         # load GEF
         __gef__ = GefCommand()
         __gef__.setup()
+
+        gdb.execute("save gdb-index {}".format(get_gef_setting("gef.tempdir")))
 
         # gdb events configuration
         gef_on_continue_hook(continue_handler)
